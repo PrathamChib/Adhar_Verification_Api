@@ -113,7 +113,7 @@ function getActiveSessionForResend(req, aadhaarFromBody) {
 
 app.post("/send-otp", async (req, res) => {
   try {
-    const { aadhaar } = req.body || {};
+    const { aadhaar } = req.query || {};
     const clientKey = getClientKey(req);
 
     if (!isValidAadhaar(aadhaar)) {
@@ -155,7 +155,7 @@ app.post("/send-otp", async (req, res) => {
 
 app.post("/resend-otp", async (req, res) => {
   try {
-    const { aadhaar } = req.body || {};
+    const { aadhaar } = req.query || {};
     const result = getActiveSessionForResend(req, aadhaar);
 
     if (result.error === "INVALID_AADHAAR") {
@@ -191,7 +191,7 @@ app.post("/resend-otp", async (req, res) => {
 
 app.post("/verify-otp", (req, res) => {
   try {
-    const { otp } = req.body || {};
+    const { otp } = req.query || {};
     const clientKey = getClientKey(req);
 
     if (!isValidOtp(otp)) {
