@@ -1,18 +1,20 @@
 require("dotenv").config();
 
 const express = require("express");
-const axios = require("axios");
+const twilio = require("twilio");
 const crypto = require("crypto");
 
 const app = express();
 app.use(express.json());
 app.set("trust proxy", true);
 
-const PORT = Number(process.env.PORT) || 3000;
-const BOT_TOKEN = process.env.BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN;
-const CHAT_ID = process.env.CHAT_ID || process.env.TELEGRAM_CHAT_ID;
+const PORT = process.env.PORT || 3000;
+const twilioClient = twilio(
+  process.env.TWILIO_ACCOUNT_SID,
+  process.env.TWILIO_AUTH_TOKEN
+);
 
-const OTP_EXPIRY_MS = 2 * 60 * 1000;
+const OTP_EXPIRY_MS = 5 * 60 * 1000;
 const MAX_ATTEMPTS = 3;
 const SESSION_CLEANUP_INTERVAL_MS = 30 * 1000;
 
@@ -20,6 +22,11 @@ const SESSION_CLEANUP_INTERVAL_MS = 30 * 1000;
 const otpSessions = new Map();
 // Stores client key (IP) -> Aadhaar for verification flow
 const clientToAadhaar = new Map();
+
+const aadhaarPhoneMap = {
+  "898400965625": "+917006483722",
+  "676767676767": "+91788940413"
+};
 
 function isValidAadhaar(aadhaar) {
   return typeof aadhaar === "string" && /^\d{12}$/.test(aadhaar);
@@ -57,24 +64,17 @@ function cleanupExpiredSessions() {
 
 setInterval(cleanupExpiredSessions, SESSION_CLEANUP_INTERVAL_MS).unref();
 
-async function sendOtpViaTelegram(otp) {
-  if (!BOT_TOKEN || !CHAT_ID) {
-    throw new Error("Missing BOT_TOKEN or CHAT_ID environment variables");
+async function sendOtpViaTwilio(phoneNumber, otp) {
+  try {
+    await twilioClient.messages.create({
+      body: `Your OTP for Aadhaar verification is: ${otp}`,
+      from: process.env.TWILIO_PHONE_NUMBER,
+      to: phoneNumber
+    });
+  } catch (error) {
+    console.error("Twilio send failed:", error);
+    throw new Error("TWILIO_SEND_FAILED");
   }
-
-  const telegramUrl = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
-  const message = `Your OTP for Aadhaar verification is: ${otp}`;
-
-  await axios.post(
-    telegramUrl,
-    {
-      chat_id: CHAT_ID,
-      text: message
-    },
-    {
-      timeout: 5000
-    }
-  );
 }
 
 app.get("/health", (_req, res) => {
@@ -120,6 +120,12 @@ app.post("/send-otp", async (req, res) => {
       return res.status(400).json({ error: "INVALID_AADHAAR" });
     }
 
+    const phoneNumber = aadhaarPhoneMap[aadhaar];
+    if (!phoneNumber) {
+      console.log(`Aadhaar mapping not found for: ${aadhaar}`);
+      return res.status(404).json({ error: "AADHAAR_NOT_FOUND" });
+    }
+
     const existingSession = otpSessions.get(aadhaar);
     if (existingSession && !isExpired(existingSession)) {
       return res.status(429).json({ error: "OTP_ALREADY_SENT" });
@@ -136,19 +142,22 @@ app.post("/send-otp", async (req, res) => {
     };
 
     try {
-      await sendOtpViaTelegram(otp);
+      await sendOtpViaTwilio(phoneNumber, otp);
     } catch (error) {
-      return res.status(502).json({ error: "TELEGRAM_SEND_FAILED" });
+      return res.status(502).json({ error: "TWILIO_SEND_FAILED" });
     }
 
     otpSessions.set(aadhaar, session);
     clientToAadhaar.set(clientKey, aadhaar);
+
+    console.log(`OTP successfully sent for Aadhaar: ${aadhaar} to ${phoneNumber}`);
 
     return res.status(200).json({
       status: "OTP_SENT",
       expires_in_seconds: OTP_EXPIRY_MS / 1000
     });
   } catch (error) {
+    console.error("Internal server error in /send-otp:", error);
     return res.status(500).json({ error: "INTERNAL_SERVER_ERROR" });
   }
 });
@@ -171,20 +180,27 @@ app.post("/resend-otp", async (req, res) => {
     }
 
     const { aadhaar: resolvedAadhaar, session, clientKey } = result;
+    const phoneNumber = aadhaarPhoneMap[resolvedAadhaar];
+    
+    if (!phoneNumber) {
+      return res.status(404).json({ error: "AADHAAR_NOT_FOUND" });
+    }
 
     try {
-      await sendOtpViaTelegram(session.otp);
+      await sendOtpViaTwilio(phoneNumber, session.otp);
     } catch (error) {
-      return res.status(502).json({ error: "TELEGRAM_SEND_FAILED" });
+      return res.status(502).json({ error: "TWILIO_SEND_FAILED" });
     }
 
     clientToAadhaar.set(clientKey, resolvedAadhaar);
+    console.log(`OTP successfully resent for Aadhaar: ${resolvedAadhaar} to ${phoneNumber}`);
 
     return res.status(200).json({
       status: "OTP_RESENT",
       expires_in_seconds: Math.max(0, Math.ceil((session.expiresAt - Date.now()) / 1000))
     });
   } catch (error) {
+    console.error("Internal server error in /resend-otp:", error);
     return res.status(500).json({ error: "INTERNAL_SERVER_ERROR" });
   }
 });
@@ -227,26 +243,21 @@ app.post("/verify-otp", (req, res) => {
       });
     }
 
-    if (session.attemptsLeft <= 0) {
-      removeSession(session.aadhaar);
-      return res.status(429).json({
-        verified: false,
-        error: "MAX_ATTEMPTS_EXCEEDED"
-      });
-    }
-
     if (session.otp === otp) {
       removeSession(session.aadhaar);
+      console.log(`OTP verified successfully for Aadhaar: ${session.aadhaar}`);
       return res.status(200).json({ verified: true });
     }
 
     session.attemptsLeft -= 1;
 
-    if (session.attemptsLeft <= 0) {
+    if (session.attemptsLeft === 0) {
       removeSession(session.aadhaar);
-      return res.status(429).json({
+
+      return res.status(401).json({
         verified: false,
-        error: "MAX_ATTEMPTS_EXCEEDED"
+        error: "INVALID_OTP",
+        attempts_left: 0
       });
     }
 
@@ -256,6 +267,7 @@ app.post("/verify-otp", (req, res) => {
       attempts_left: session.attemptsLeft
     });
   } catch (error) {
+    console.error("Internal server error in /verify-otp:", error);
     return res.status(500).json({
       verified: false,
       error: "INTERNAL_SERVER_ERROR"
@@ -264,6 +276,7 @@ app.post("/verify-otp", (req, res) => {
 });
 
 app.use((err, _req, res, _next) => {
+  console.error("Unhandled exception:", err);
   return res.status(500).json({
     error: "INTERNAL_SERVER_ERROR",
     message: err?.message || "Unexpected error"
