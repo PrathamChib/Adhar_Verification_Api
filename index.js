@@ -3,6 +3,7 @@ require("dotenv").config();
 const express = require("express");
 const twilio = require("twilio");
 const crypto = require("crypto");
+const aadhaarData = require("./aadhaar-data");
 
 const app = express();
 app.use(express.json());
@@ -23,18 +24,12 @@ const otpSessions = new Map();
 // Stores client key (IP) -> Aadhaar for verification flow
 const clientToAadhaar = new Map();
 
-const aadhaarPhoneMap = {
-  "898400965625": "+917006483722",
-  "676767676767": "+91788940413"
-};
-
-const aadhaarVidMap = {
-  "898400965625": "1234567890123456",
-  "676767676767": "9876543210987654"
-};
-
 function isValidAadhaar(aadhaar) {
   return typeof aadhaar === "string" && /^\d{12}$/.test(aadhaar);
+}
+
+function isValidVid(vid) {
+  return typeof vid === "string" && /^\d{16}$/.test(vid);
 }
 
 function isValidOtp(otp) {
@@ -52,6 +47,32 @@ function generateIrreversibleAadhaarCode(aadhaar) {
     .update(aadhaar)
     .digest("hex")
     .substring(0, 32);
+}
+
+function maskAadhaar(aadhaar) {
+  if (!aadhaar || aadhaar.length < 4) return aadhaar;
+  return "XXXXXXXX" + aadhaar.slice(-4);
+}
+
+function maskMobile(mobile) {
+  if (!mobile || mobile.length < 4) return mobile;
+  return "XXXXXX" + mobile.slice(-4);
+}
+
+function maskName(name) {
+  if (!name) return name;
+  return name.split(" ").map(word => {
+    if (word.length <= 2) return word;
+    return word.substring(0, 2) + "*".repeat(word.length - 2);
+  }).join(" ");
+}
+
+function findRecordByAadhaar(aadhaar) {
+  return aadhaarData.find(r => r.aadhaar === aadhaar);
+}
+
+function findRecordByVid(vid) {
+  return aadhaarData.find(r => r.vid === vid);
 }
 
 function removeSession(aadhaar) {
@@ -81,7 +102,7 @@ setInterval(cleanupExpiredSessions, SESSION_CLEANUP_INTERVAL_MS).unref();
 async function sendOtpViaTwilio(phoneNumber, otp) {
   try {
     await twilioClient.messages.create({
-      body: `Your OTP for Aadhaar verification is: ${otp}`,
+      body: `Your OTP for KYC verification is: ${otp}`,
       from: process.env.TWILIO_PHONE_NUMBER,
       to: phoneNumber
     });
@@ -96,9 +117,85 @@ app.get("/health", (_req, res) => {
 });
 
 function getClientKey(req) {
-  // `req.ip` is proxy-aware when trust proxy is enabled (recommended on Render).
   return req.ip || req.socket.remoteAddress || "unknown-client";
 }
+
+async function processSendOtp(req, res, aadhaar, phoneNumber, identifierType, identifierValue) {
+  const clientKey = getClientKey(req);
+
+  const existingSession = otpSessions.get(aadhaar);
+  if (existingSession && !isExpired(existingSession)) {
+    return res.status(429).json({ error: "OTP_ALREADY_SENT" });
+  }
+
+  const otp = generateSixDigitOtp();
+  const createdAt = Date.now();
+  const session = {
+    aadhaar,
+    otp,
+    createdAt,
+    expiresAt: createdAt + OTP_EXPIRY_MS,
+    attemptsLeft: MAX_ATTEMPTS
+  };
+
+  try {
+    await sendOtpViaTwilio(phoneNumber, otp);
+  } catch (error) {
+    return res.status(502).json({ error: "TWILIO_SEND_FAILED" });
+  }
+
+  otpSessions.set(aadhaar, session);
+  clientToAadhaar.set(clientKey, aadhaar);
+
+  console.log(`OTP successfully sent for ${identifierType}: ${identifierValue} to ${phoneNumber}`);
+
+  return res.status(200).json({
+    status: "OTP_SENT",
+    expires_in_seconds: OTP_EXPIRY_MS / 1000
+  });
+}
+
+app.post("/send-otp", async (req, res) => {
+  try {
+    const { aadhaar } = req.query || {};
+
+    if (!isValidAadhaar(aadhaar)) {
+      return res.status(400).json({ error: "INVALID_AADHAAR" });
+    }
+
+    const record = findRecordByAadhaar(aadhaar);
+    if (!record) {
+      console.log(`Aadhaar record not found for: ${aadhaar}`);
+      return res.status(404).json({ error: "AADHAAR_NOT_FOUND" });
+    }
+
+    return await processSendOtp(req, res, aadhaar, record.mobile, "Aadhaar", aadhaar);
+  } catch (error) {
+    console.error("Internal server error in /send-otp:", error);
+    return res.status(500).json({ error: "INTERNAL_SERVER_ERROR" });
+  }
+});
+
+app.post("/send-otp-via-vid", async (req, res) => {
+  try {
+    const { vid } = req.query || {};
+
+    if (!isValidVid(vid)) {
+      return res.status(400).json({ error: "INVALID_VID" });
+    }
+
+    const record = findRecordByVid(vid);
+    if (!record) {
+      console.log(`VID record not found for: ${vid}`);
+      return res.status(404).json({ error: "VID_NOT_FOUND" });
+    }
+
+    return await processSendOtp(req, res, record.aadhaar, record.mobile, "VID", vid);
+  } catch (error) {
+    console.error("Internal server error in /send-otp-via-vid:", error);
+    return res.status(500).json({ error: "INTERNAL_SERVER_ERROR" });
+  }
+});
 
 function getActiveSessionForResend(req, aadhaarFromBody) {
   const clientKey = getClientKey(req);
@@ -125,57 +222,6 @@ function getActiveSessionForResend(req, aadhaarFromBody) {
   return { aadhaar, session, clientKey };
 }
 
-app.post("/send-otp", async (req, res) => {
-  try {
-    const { aadhaar } = req.query || {};
-    const clientKey = getClientKey(req);
-
-    if (!isValidAadhaar(aadhaar)) {
-      return res.status(400).json({ error: "INVALID_AADHAAR" });
-    }
-
-    const phoneNumber = aadhaarPhoneMap[aadhaar];
-    if (!phoneNumber) {
-      console.log(`Aadhaar mapping not found for: ${aadhaar}`);
-      return res.status(404).json({ error: "AADHAAR_NOT_FOUND" });
-    }
-
-    const existingSession = otpSessions.get(aadhaar);
-    if (existingSession && !isExpired(existingSession)) {
-      return res.status(429).json({ error: "OTP_ALREADY_SENT" });
-    }
-
-    const otp = generateSixDigitOtp();
-    const createdAt = Date.now();
-    const session = {
-      aadhaar,
-      otp,
-      createdAt,
-      expiresAt: createdAt + OTP_EXPIRY_MS,
-      attemptsLeft: MAX_ATTEMPTS
-    };
-
-    try {
-      await sendOtpViaTwilio(phoneNumber, otp);
-    } catch (error) {
-      return res.status(502).json({ error: "TWILIO_SEND_FAILED" });
-    }
-
-    otpSessions.set(aadhaar, session);
-    clientToAadhaar.set(clientKey, aadhaar);
-
-    console.log(`OTP successfully sent for Aadhaar: ${aadhaar} to ${phoneNumber}`);
-
-    return res.status(200).json({
-      status: "OTP_SENT",
-      expires_in_seconds: OTP_EXPIRY_MS / 1000
-    });
-  } catch (error) {
-    console.error("Internal server error in /send-otp:", error);
-    return res.status(500).json({ error: "INTERNAL_SERVER_ERROR" });
-  }
-});
-
 app.post("/resend-otp", async (req, res) => {
   try {
     const { aadhaar } = req.query || {};
@@ -194,11 +240,12 @@ app.post("/resend-otp", async (req, res) => {
     }
 
     const { aadhaar: resolvedAadhaar, session, clientKey } = result;
-    const phoneNumber = aadhaarPhoneMap[resolvedAadhaar];
+    const record = findRecordByAadhaar(resolvedAadhaar);
     
-    if (!phoneNumber) {
+    if (!record) {
       return res.status(404).json({ error: "AADHAAR_NOT_FOUND" });
     }
+    const phoneNumber = record.mobile;
 
     try {
       await sendOtpViaTwilio(phoneNumber, session.otp);
@@ -258,19 +305,23 @@ app.post("/verify-otp", (req, res) => {
     }
 
     if (session.otp === otp) {
-      // Generate irreversible Aadhaar reference ID
       const aadhaarReferenceId = generateIrreversibleAadhaarCode(session.aadhaar);
-      
-      // Internally resolve VID if needed for future logic (not returned in response)
-      const vid = aadhaarVidMap[session.aadhaar];
+      const record = findRecordByAadhaar(session.aadhaar);
 
-      // Remove session only AFTER successful verification response is prepared
       removeSession(session.aadhaar);
       console.log(`OTP verified successfully for Aadhaar: ${session.aadhaar}`);
       
       return res.status(200).json({
         verified: true,
-        aadhaar_reference_id: aadhaarReferenceId
+        aadhaar_reference_id: aadhaarReferenceId,
+        kyc_details: {
+          name: maskName(record.details.name),
+          aadhaar_number: maskAadhaar(record.aadhaar),
+          mobile: maskMobile(record.mobile),
+          gender: record.details.gender,
+          dob: record.details.dob,
+          address: record.details.address
+        }
       });
     }
 

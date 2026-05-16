@@ -1,13 +1,17 @@
-# Aadhaar OTP Verification API (Telegram)
+# Aadhaar OTP Verification API (Twilio)
 
-Production-ready Node.js + Express backend that sends OTP via Telegram Bot API and verifies OTP with expiry and attempt limits.
+Production-ready Node.js + Express backend that sends OTP via Twilio SMS and verifies OTP with expiry, attempt limits, UIDAI-style irreversible reference IDs, and masked KYC data. Supports both Aadhaar-based and VID-based KYC flows.
 
 ## Features
 
-- `POST /send-otp` with Aadhaar validation (12 digits).
-- `POST /resend-otp` to resend active OTP without generating a new one.
-- `POST /verify-otp` using OTP only (Aadhaar is mapped internally).
-- OTP expires in 2 minutes.
+- **Aadhaar KYC**: `POST /send-otp?aadhaar=...` with Aadhaar validation (12 digits).
+- **VID KYC**: `POST /send-otp-via-vid?vid=...` with VID validation (16 digits).
+- **Resend OTP**: `POST /resend-otp?aadhaar=...` to resend active OTP without generating a new one.
+- **Verify OTP**: `POST /verify-otp?otp=...` verifies OTP and returns masked user KYC details.
+- Internal-only VID and dynamic data mapping via `aadhaar-data.js`.
+- Returns UIDAI-style irreversible Aadhaar reference ID on successful verification.
+- Sensitive KYC data (Name, Aadhaar, Mobile) is masked in the response.
+- OTP expires in 5 minutes.
 - Maximum 3 verification attempts.
 - One active OTP per Aadhaar (anti-spam behavior).
 - Expired session cleanup in memory.
@@ -18,19 +22,21 @@ Production-ready Node.js + Express backend that sends OTP via Telegram Bot API a
 
 - Node.js
 - Express.js
-- Axios (Telegram API calls)
+- Twilio SDK (SMS API calls)
+- Crypto (Built-in for HMAC hashing)
 - dotenv (environment variables)
 
 ## Project Structure
 
-- `server.js` - API implementation and OTP session logic
+- `index.js` - API implementation and OTP session logic
+- `aadhaar-data.js` - Mock database containing structured Aadhaar, VID, and user records
 - `package.json` - dependencies and scripts
 - `.env.example` - environment variables template
 - `README.md` - setup, testing, deployment instructions
 
 ## Environment Variables
 
-Create `.env` from `.env.example`:
+Create `.env` from `.env.example` (or manually create it):
 
 ```bash
 cp .env.example .env
@@ -38,15 +44,19 @@ cp .env.example .env
 
 Set:
 
-- `BOT_TOKEN` (or `TELEGRAM_BOT_TOKEN`) - Telegram bot token
-- `CHAT_ID` (or `TELEGRAM_CHAT_ID`) - Telegram chat ID where OTP messages will be delivered
+- `TWILIO_ACCOUNT_SID` - Twilio Account SID
+- `TWILIO_AUTH_TOKEN` - Twilio Auth Token
+- `TWILIO_PHONE_NUMBER` - Twilio Phone Number (with country code, e.g., +1234567890)
+- `AADHAAR_HASH_SECRET` - Secret key used to generate irreversible Aadhaar Reference IDs (e.g., `uidai-mock-secret-2026`)
 - `PORT` - server port (Render automatically provides this at runtime)
 
 Example:
 
 ```env
-BOT_TOKEN=your_telegram_bot_token_here
-CHAT_ID=your_telegram_chat_id_here
+TWILIO_ACCOUNT_SID=your_twilio_sid_here
+TWILIO_AUTH_TOKEN=your_twilio_auth_token_here
+TWILIO_PHONE_NUMBER=+1234567890
+AADHAAR_HASH_SECRET=your_super_secret_hash_key
 PORT=3000
 ```
 
@@ -71,122 +81,73 @@ curl http://localhost:3000/health
 
 ## API Contract
 
-### 1) Send OTP
+*Note: All endpoints currently expect parameters to be passed in the URL Query String.*
 
-**Endpoint**: `POST /send-otp`  
-**Body**:
+### 1) Send OTP (Aadhaar Method)
 
-```json
-{
-  "aadhaar": "123456789012"
-}
-```
+**Endpoint**: `POST /send-otp?aadhaar=123456789012`  
 
 **Success (200)**:
 
 ```json
 {
   "status": "OTP_SENT",
-  "expires_in_seconds": 120
+  "expires_in_seconds": 300
 }
 ```
 
-**Errors**:
+### 2) Send OTP (VID Method)
 
-- `400`:
+**Endpoint**: `POST /send-otp-via-vid?vid=1234567890123456`  
+
+**Success (200)**:
 
 ```json
 {
-  "error": "INVALID_AADHAAR"
+  "status": "OTP_SENT",
+  "expires_in_seconds": 300
 }
 ```
 
-- `429`:
+**Errors (for both send-otp methods)**:
 
-```json
-{
-  "error": "OTP_ALREADY_SENT"
-}
-```
+- `400`: `{"error": "INVALID_AADHAAR"}` or `{"error": "INVALID_VID"}`
+- `404`: `{"error": "AADHAAR_NOT_FOUND"}` or `{"error": "VID_NOT_FOUND"}`
+- `429`: `{"error": "OTP_ALREADY_SENT"}`
+- `502`: `{"error": "TWILIO_SEND_FAILED"}`
 
-- `502`:
+### 3) Resend OTP
 
-```json
-{
-  "error": "TELEGRAM_SEND_FAILED"
-}
-```
-
-### 2) Resend OTP
-
-**Endpoint**: `POST /resend-otp`  
-**Body** (optional Aadhaar; if omitted, current client flow mapping is used):
-
-```json
-{
-  "aadhaar": "123456789012"
-}
-```
+**Endpoint**: `POST /resend-otp?aadhaar=123456789012`  
+*(Note: aadhaar query param is optional if current client IP flow mapping is active)*
 
 **Success (200)**:
 
 ```json
 {
   "status": "OTP_RESENT",
-  "expires_in_seconds": 95
+  "expires_in_seconds": 295
 }
 ```
 
-**Errors**:
+### 4) Verify OTP
 
-- `400`:
-
-```json
-{
-  "error": "INVALID_AADHAAR"
-}
-```
-
-- `404`:
-
-```json
-{
-  "error": "OTP_SESSION_NOT_FOUND"
-}
-```
-
-- `410`:
-
-```json
-{
-  "error": "OTP_EXPIRED"
-}
-```
-
-- `502`:
-
-```json
-{
-  "error": "TELEGRAM_SEND_FAILED"
-}
-```
-
-### 3) Verify OTP
-
-**Endpoint**: `POST /verify-otp`  
-**Body**:
-
-```json
-{
-  "otp": "123456"
-}
-```
+**Endpoint**: `POST /verify-otp?otp=123456`  
 
 **Success (200)**:
 
 ```json
 {
-  "verified": true
+  "verified": true,
+  "aadhaar_reference_id": "89b5a0346a084ad3e20dfbe5171dfbb9",
+  "kyc_details": {
+    "name": "Pr***** Ch**",
+    "aadhaar_number": "XXXXXXXX5625",
+    "mobile": "XXXXXX3722",
+    "gender": "Male",
+    "dob": "25-08-2004",
+    "address": "Bangalore, Karnataka"
+  }
 }
 ```
 
@@ -200,64 +161,37 @@ curl http://localhost:3000/health
 }
 ```
 
-**Max attempts exceeded (429)**:
+**Expired/Not Found**:
 
-```json
-{
-  "verified": false,
-  "error": "MAX_ATTEMPTS_EXCEEDED"
-}
-```
-
-**Expired OTP (410)**:
-
-```json
-{
-  "verified": false,
-  "error": "OTP_EXPIRED"
-}
-```
-
-**Session not found (404)**:
-
-```json
-{
-  "verified": false,
-  "error": "OTP_SESSION_NOT_FOUND"
-}
-```
+- `410`: `{"error": "OTP_EXPIRED"}`
+- `404`: `{"error": "OTP_SESSION_NOT_FOUND"}`
 
 ## cURL Examples
 
-### Send OTP
+### Send OTP (Aadhaar)
 
 ```bash
-curl -X POST http://localhost:3000/send-otp \
-  -H "Content-Type: application/json" \
-  -d '{"aadhaar":"123456789012"}'
+curl -X POST "http://localhost:3000/send-otp?aadhaar=898400965625"
+```
+
+### Send OTP (VID)
+
+```bash
+curl -X POST "http://localhost:3000/send-otp-via-vid?vid=1234567890123456"
 ```
 
 ### Verify OTP
 
 ```bash
-curl -X POST http://localhost:3000/verify-otp \
-  -H "Content-Type: application/json" \
-  -d '{"otp":"123456"}'
+curl -X POST "http://localhost:3000/verify-otp?otp=123456"
 ```
 
-### Resend OTP
+## Twilio Setup Notes
 
-```bash
-curl -X POST http://localhost:3000/resend-otp \
-  -H "Content-Type: application/json" \
-  -d '{"aadhaar":"123456789012"}'
-```
-
-## Telegram Setup Notes
-
-- Create a bot via [@BotFather](https://t.me/BotFather) and copy bot token.
-- Get your numeric chat ID and set `CHAT_ID`.
-- Ensure your bot can send messages to that chat.
+- Create an account on [Twilio](https://www.twilio.com/).
+- Get your `Account SID` and `Auth Token` from the Twilio console.
+- Provision a Twilio Phone Number to send SMS.
+- Ensure your Twilio account is upgraded or the recipient numbers are verified in Twilio if using a trial account.
 
 ## Render Deployment
 
@@ -267,19 +201,14 @@ curl -X POST http://localhost:3000/resend-otp \
 4. Use:
    - **Environment**: `Node`
    - **Build Command**: `npm install`
-   - **Start Command**: `npm start`
-5. Add environment variables in Render dashboard:
-   - `BOT_TOKEN`
-   - `CHAT_ID`
-   - `PORT` (optional on Render; Render usually injects this automatically)
+   - **Start Command**: `node index.js` (or `npm start` if defined in package.json)
+5. Add environment variables in Render dashboard.
 6. Deploy.
-
-Recommended health endpoint for monitoring: `GET /health`.
 
 ## Security and Production Notes
 
 - Do not commit `.env` to source control.
-- OTP sessions are currently in-memory and reset when server restarts.
+- OTP sessions and the Aadhaar-VID mapping are currently in-memory and reset when the server restarts.
 - Verification links request flow by client IP so `verify-otp` can work without Aadhaar in the verify payload.
 - For horizontally scaled production, move sessions to Redis or a database.
-- Keep `BOT_TOKEN` and `CHAT_ID` only in environment variables.
+- Keep all secrets (`TWILIO_AUTH_TOKEN`, `AADHAAR_HASH_SECRET`, etc.) only in environment variables.
