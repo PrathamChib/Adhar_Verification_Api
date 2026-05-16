@@ -28,6 +28,11 @@ const aadhaarPhoneMap = {
   "676767676767": "+91788940413"
 };
 
+const aadhaarVidMap = {
+  "898400965625": "1234567890123456",
+  "676767676767": "9876543210987654"
+};
+
 function isValidAadhaar(aadhaar) {
   return typeof aadhaar === "string" && /^\d{12}$/.test(aadhaar);
 }
@@ -38,6 +43,15 @@ function isValidOtp(otp) {
 
 function generateSixDigitOtp() {
   return crypto.randomInt(100000, 1000000).toString();
+}
+
+function generateIrreversibleAadhaarCode(aadhaar) {
+  const secret = process.env.AADHAAR_HASH_SECRET || "uidai-mock-secret";
+  return crypto
+    .createHmac("sha256", secret)
+    .update(aadhaar)
+    .digest("hex")
+    .substring(0, 32);
 }
 
 function removeSession(aadhaar) {
@@ -244,9 +258,20 @@ app.post("/verify-otp", (req, res) => {
     }
 
     if (session.otp === otp) {
+      // Generate irreversible Aadhaar reference ID
+      const aadhaarReferenceId = generateIrreversibleAadhaarCode(session.aadhaar);
+      
+      // Internally resolve VID if needed for future logic (not returned in response)
+      const vid = aadhaarVidMap[session.aadhaar];
+
+      // Remove session only AFTER successful verification response is prepared
       removeSession(session.aadhaar);
       console.log(`OTP verified successfully for Aadhaar: ${session.aadhaar}`);
-      return res.status(200).json({ verified: true });
+      
+      return res.status(200).json({
+        verified: true,
+        aadhaar_reference_id: aadhaarReferenceId
+      });
     }
 
     session.attemptsLeft -= 1;
