@@ -67,6 +67,25 @@ function maskName(name) {
   }).join(" ");
 }
 
+function calculateAge(dobString) {
+  if (!dobString) return null;
+  const parts = dobString.split("-");
+  if (parts.length !== 3) return null;
+  const day = parseInt(parts[0], 10);
+  const month = parseInt(parts[1], 10) - 1;
+  const year = parseInt(parts[2], 10);
+
+  const dob = new Date(year, month, day);
+  const today = new Date();
+
+  let age = today.getFullYear() - dob.getFullYear();
+  const monthDiff = today.getMonth() - dob.getMonth();
+  if (monthDiff < 0 || (monthDiff === 0 && today.getDate() < dob.getDate())) {
+    age--;
+  }
+  return age;
+}
+
 function findRecordByAadhaar(aadhaar) {
   return aadhaarData.find(r => r.aadhaar === aadhaar);
 }
@@ -241,7 +260,7 @@ app.post("/resend-otp", async (req, res) => {
 
     const { aadhaar: resolvedAadhaar, session, clientKey } = result;
     const record = findRecordByAadhaar(resolvedAadhaar);
-    
+
     if (!record) {
       return res.status(404).json({ error: "AADHAAR_NOT_FOUND" });
     }
@@ -310,16 +329,26 @@ app.post("/verify-otp", (req, res) => {
 
       removeSession(session.aadhaar);
       console.log(`OTP verified successfully for Aadhaar: ${session.aadhaar}`);
-      
+
+      const nameParts = record.details.name.trim().split(/\s+/);
+      const firstName = nameParts[0] || "";
+      const lastName = nameParts.slice(1).join(" ") || "";
+      const age = calculateAge(record.details.dob);
+      const currentDate = new Date().toISOString().split("T")[0];
+
       return res.status(200).json({
         verified: true,
         aadhaar_reference_id: aadhaarReferenceId,
         kyc_details: {
           name: maskName(record.details.name),
+          first_name: firstName,
+          last_name: lastName,
           aadhaar_number: maskAadhaar(record.aadhaar),
           mobile: maskMobile(record.mobile),
           gender: record.details.gender,
           dob: record.details.dob,
+          age: age,
+          date: currentDate,
           address: record.details.address
         }
       });
