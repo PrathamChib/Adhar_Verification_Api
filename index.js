@@ -344,7 +344,7 @@ app.post("/verify-otp", (req, res) => {
           first_name: firstName,
           last_name: lastName,
           aadhaar_number: maskAadhaar(record.aadhaar),
-          mobile: maskMobile(record.mobile),
+          mobile: record.mobile,
           gender: record.details.gender,
           dob: record.details.dob,
           age: age,
