@@ -1,6 +1,6 @@
 module.exports = [
   {
-    aadhaar: "8984 0096 5625",
+    aadhaar: "898400965625",
     vid: "1234567890123456",
     mobile: "+917006483722",
     details: {
